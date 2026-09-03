@@ -28,3 +28,4 @@
 
 ## Mined gaps (discovered, not yet attempted)
 - (pending trivial-fix hunt)
+- `2026-09-03` self-found gap (NOTICE.md license refs) — outcome pr-opened (fork PR #1) — 4 genuine fixes: Jodd/Caffeine/Brotli4j wrong license file refs + stale HdrHistogram entry (license file removed in 92445994a). No upstream PR touches these strings.
