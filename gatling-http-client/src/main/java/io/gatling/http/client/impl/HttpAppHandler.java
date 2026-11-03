@@ -16,6 +16,7 @@
 
 package io.gatling.http.client.impl;
 
+import io.gatling.http.client.impl.compression.CustomHttpContentDecompressor;
 import io.gatling.http.client.impl.request.WritableRequest;
 import io.gatling.http.client.impl.request.WritableRequestBuilder;
 import io.gatling.http.client.pool.ChannelPool;
@@ -35,12 +36,17 @@ final class HttpAppHandler extends ChannelDuplexHandler {
 
   private final DefaultHttpClient client;
   private final ChannelPool channelPool;
+  private final CustomHttpContentDecompressor decompressor;
   private HttpTx tx;
   private boolean httpResponseReceived;
 
-  HttpAppHandler(DefaultHttpClient client, ChannelPool channelPool) {
+  HttpAppHandler(
+      DefaultHttpClient client,
+      ChannelPool channelPool,
+      CustomHttpContentDecompressor decompressor) {
     this.client = client;
     this.channelPool = channelPool;
+    this.decompressor = decompressor;
   }
 
   @Override
@@ -101,6 +107,7 @@ final class HttpAppHandler extends ChannelDuplexHandler {
       LOGGER.debug("Write request {}", request);
 
       tx.listener.onWrite(ctx.channel());
+      decompressor.setEnabled(tx.listener.isResponseBodyDecompressionRequired());
       if (HttpUtil.is100ContinueExpected(request.getRequest())) {
         LOGGER.debug("Delaying body write");
         tx.pendingRequestExpectingContinue = request;
@@ -132,11 +139,13 @@ final class HttpAppHandler extends ChannelDuplexHandler {
         return;
 
       } else {
-        // TODO implement 417 support
+        // eg a 417, Gatling then sends the request again without expectation, see ResponseProcessor
         LOGGER.debug(
             "Request was sent with Expect:100-Continue but received response with status {}, dropping",
             status);
         tx.releasePendingRequestExpectingContinue();
+        // the server might still expect the body we didn't send, don't reuse the connection
+        tx.closeConnection = true;
       }
     }
 
@@ -247,10 +256,11 @@ final class HttpAppHandler extends ChannelDuplexHandler {
 
     HttpTx tx = this.tx;
     setInactive();
-    tx.requestTimeout.cancel();
 
     // only retry when we haven't started receiving response
     if (!httpResponseReceived && client.canRetry(tx)) {
+      // don't cancel the request timeout: the retry keeps the original deadline, and a cancelled
+      // timeout would make the retry drop the request
       client.retry(tx, ctx.channel().eventLoop());
     } else {
       crash(ctx, PrematureCloseException.INSTANCE, false, tx);
@@ -261,14 +271,12 @@ final class HttpAppHandler extends ChannelDuplexHandler {
   public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
     releasePendingRequestExpectingContinue();
 
-    if (cause instanceof Error) {
-      LOGGER.error("Fatal error", cause);
-      System.exit(1);
+    if (!isInactive()) {
+      crash(ctx, cause, true, tx);
     }
 
-    if (isInactive()) {
-      return;
+    if (cause instanceof Error) {
+      client.onFatalError(cause);
     }
-    crash(ctx, cause, true, tx);
   }
 }

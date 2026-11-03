@@ -54,7 +54,17 @@ public interface RequestTimeout {
 
     @Override
     public void start(EventLoop eventLoop) {
-      f = eventLoop.schedule(this::execute, timeout, TimeUnit.MILLISECONDS);
+      // retries go through start again: keep the original deadline instead of scheduling another
+      // timeout that would notify the listener a second time
+      if (f == null) {
+        f = eventLoop.schedule(this::execute, timeout, TimeUnit.MILLISECONDS);
+      } else if (f.isCancelled()) {
+        // the timeout is only cancelled once the request completed or failed, sending it again
+        // is a bug, and as the timeout is done, the request would be silently dropped
+        listener.onThrowable(
+            new IllegalStateException(
+                "Request timeout was cancelled before sending the request again, please report"));
+      }
     }
 
     private void execute() {
@@ -83,6 +93,8 @@ public interface RequestTimeout {
     public void setChannel(Channel channel) {
       this.channel = channel;
       remoteAddress = (InetSocketAddress) channel.remoteAddress();
+      // when retrying on another connection, the previous stream id would belong to another stream
+      streamId = null;
     }
 
     public void setStreamId(int streamId) {

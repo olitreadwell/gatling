@@ -25,9 +25,12 @@ import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http2.*;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +42,21 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
 
     public StreamTimeout(int streamId) {
       this.streamId = streamId;
+    }
+  }
+
+  public static final class RstStreamFrame {
+    private final int streamId;
+    private final long errorCode;
+
+    public RstStreamFrame(int streamId, long errorCode) {
+      this.streamId = streamId;
+      this.errorCode = errorCode;
+    }
+
+    @Override
+    public String toString() {
+      return "RstStreamFrame{streamId=" + streamId + ", errorCode=" + errorCode + '}';
     }
   }
 
@@ -60,28 +78,46 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
   private static final Logger LOGGER = LoggerFactory.getLogger(Http2AppHandler.class);
   private static final IOException REMOTELY_CLOSED_EXCEPTION =
       new IOException("Channel was closed before handshake completed");
+  private static final IOException CONNECTION_CLOSED_EXCEPTION =
+      new IOException("Connection was closed while the stream was in flight");
 
-  private final DefaultHttpClient client;
+  private final BiConsumer<List<HttpTx>, EventLoop> retry;
+  private final Consumer<Throwable> fatalErrorHandler;
   private final Http2ConnectionHandler http2ConnectionHandler;
   private final ChannelPool channelPool;
 
   // mutable state
   private boolean writeReached = false;
-  private int nextStreamId = 1;
+  // like Netty, client streams start at 3, as 1 is reserved for the HTTP/1.1 upgrade
+  private int lastStreamId = 1;
   private final Map<Integer, HttpTx> txByStreamId = new HashMap<>();
 
   Http2AppHandler(
-      DefaultHttpClient client,
+      BiConsumer<List<HttpTx>, EventLoop> retry,
+      Consumer<Throwable> fatalErrorHandler,
       Http2ConnectionHandler http2ConnectionHandler,
       ChannelPool channelPool) {
-    this.client = client;
+    this.retry = retry;
+    this.fatalErrorHandler = fatalErrorHandler;
     this.http2ConnectionHandler = http2ConnectionHandler;
     this.channelPool = channelPool;
+  }
+
+  // streams dropped by a GOAWAY or refused with REFUSED_STREAM were not processed by the server, so
+  // they can be retried whatever the request (RFC 9113 section 8.7), but only once to avoid
+  // looping, and only if the body can be replayed
+  private static boolean canRetryUnprocessedStream(HttpTx tx) {
+    return tx.channelState != HttpTx.ChannelState.RETRY && tx.isBodyReplayable();
   }
 
   @Override
   public boolean isSharable() {
     return false;
+  }
+
+  boolean isResponseBodyDecompressionRequired(int streamId) {
+    HttpTx tx = txByStreamId.get(streamId);
+    return tx == null || tx.listener.isResponseBodyDecompressionRequired();
   }
 
   @Override
@@ -93,8 +129,22 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
       channelPool.offer(ctx.channel());
       return;
     }
-    nextStreamId += 2; // that's how Netty works, 1 is reserved for the connection itself
-    int thisStreamId = nextStreamId;
+    // we can't use Http2Connection.Endpoint#incrementAndGetNextStreamId as
+    // HttpToHttp2ConnectionHandler already calls it for every request, even with an explicit stream
+    // id, but never use an id Netty already created a stream for
+    lastStreamId =
+        Math.max(lastStreamId, http2ConnectionHandler.connection().local().lastStreamCreated());
+    if (lastStreamId > Integer.MAX_VALUE - 2) {
+      // after 2^30 streams, this connection can't open new ones: the request was never sent so it
+      // can be sent on another connection, while the in-flight streams complete before closing
+      LOGGER.debug("Stream ids exhausted, closing connection and retrying on a new one");
+      ChannelPool.markAsGoAway(ctx.channel());
+      retry.accept(Collections.singletonList(tx), ctx.channel().eventLoop());
+      ctx.close();
+      return;
+    }
+    lastStreamId += 2;
+    int thisStreamId = lastStreamId;
     txByStreamId.put(thisStreamId, tx);
 
     try {
@@ -126,7 +176,9 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
                 tx.requestTimeout.setStreamId(thisStreamId);
               }
 
-            } else {
+            } else if (txByStreamId.remove(thisStreamId) != null) {
+              // when a GOAWAY is received, StreamBufferingEncoder fails the promises of the
+              // queued streams after we've already retried or failed them in userEventTriggered
               tx.requestTimeout.cancel();
               tx.listener.onThrowable(f.cause());
             }
@@ -140,6 +192,10 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
     Integer streamId =
         response.headers().getInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
     HttpTx tx = txByStreamId.get(streamId);
+    if (tx == null) {
+      LOGGER.debug("Ignoring response headers for unknown stream {}", streamId);
+      return;
+    }
 
     if (tx.requestTimeout.isDone()) {
       tx.releasePendingRequestExpectingContinue();
@@ -151,11 +207,29 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
 
     if (tx.pendingRequestExpectingContinue != null) {
       if (status.equals(HttpResponseStatus.CONTINUE)) {
-        LOGGER.debug("Received 100-Continue");
+        // unlike with HTTP/1, 100-Continue is a HEADERS frame without END_STREAM: there's no
+        // content to wait for
+        LOGGER.debug("Received 100-Continue, sending body");
+        WritableRequest request = tx.pendingRequestExpectingContinue;
+        tx.pendingRequestExpectingContinue = null;
+        request
+            .writeContent(ctx)
+            .addListener(
+                f -> {
+                  if (!f.isSuccess() && txByStreamId.remove(streamId) != null) {
+                    tx.requestTimeout.cancel();
+                    tx.listener.onThrowable(f.cause());
+                  }
+                });
+        return;
+
+      } else if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
+        LOGGER.debug("Ignoring interim response {} while waiting for 100-Continue", status);
         return;
 
       } else {
-        // TODO implement 417 support
+        // eg a 417, Gatling then sends the request again without expectation, see ResponseProcessor
+        // the stream is reset once the response completes, as we didn't send the body
         LOGGER.debug(
             "Request was sent with Expect:100-Continue but received response with status {}, dropping",
             status);
@@ -169,6 +243,10 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
   private void channelReadHttp2Content(ChannelHandlerContext ctx, Http2Content content) {
     int streamId = content.streamId;
     HttpTx tx = txByStreamId.get(streamId);
+    if (tx == null) {
+      LOGGER.debug("Ignoring response content for unknown stream {}", streamId);
+      return;
+    }
 
     if (tx.requestTimeout.isDone()) {
       resetStream(ctx, streamId);
@@ -176,16 +254,6 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
     }
 
     boolean last = content.last;
-
-    if (tx.pendingRequestExpectingContinue != null) {
-      if (last) {
-        LOGGER.debug("Received 100-Continue' LastHttpContent, sending body");
-        tx.pendingRequestExpectingContinue.writeContent(ctx);
-        tx.pendingRequestExpectingContinue = null;
-      }
-      return;
-    }
-
     tx.listener.onHttpResponseBodyChunk(content.httpContent.content(), last);
     if (last) {
       tx.requestTimeout.cancel();
@@ -218,21 +286,26 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
       if (nonActiveStreamListener != null) {
         nonActiveStreamListener.onThrowable(cause);
       }
-      txByStreamId.forEach(
-          (id, tx) -> {
-            tx.releasePendingRequestExpectingContinue();
-            tx.listener.onThrowable(cause);
-          });
+      // clear before notifying so that late write failures and channelInactive don't notify again
+      List<HttpTx> txs = new ArrayList<>(txByStreamId.values());
+      txByStreamId.clear();
+      for (HttpTx tx : txs) {
+        tx.releasePendingRequestExpectingContinue();
+        tx.requestTimeout.cancel();
+        tx.listener.onThrowable(cause);
+      }
     } finally {
       if (close) {
-        // FIXME shouldn't we close the connection?
+        // the connection is unusable: keep it from new requests, and reset the streams whose
+        // requests were just failed, otherwise the graceful close would wait for them
+        ChannelPool.markAsGoAway(ctx.channel());
+        resetActiveStreams(ctx);
         ctx.close();
       }
     }
 
     if (cause instanceof Error) {
-      LOGGER.error("Fatal error", cause);
-      System.exit(1);
+      fatalErrorHandler.accept(cause);
     }
   }
 
@@ -243,9 +316,7 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
 
   @Override
   public void channelInactive(ChannelHandlerContext ctx) {
-    if (!writeReached) {
-      crash(ctx, REMOTELY_CLOSED_EXCEPTION, null, false);
-    }
+    crash(ctx, writeReached ? CONNECTION_CLOSED_EXCEPTION : REMOTELY_CLOSED_EXCEPTION, null, false);
   }
 
   @Override
@@ -267,15 +338,38 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
           entry -> {
             txByStreamId.remove(entry.getKey());
             HttpTx tx = entry.getValue();
-            if (goAway.errorCode == Http2Error.NO_ERROR.code() && client.canRetry(tx)) {
+            tx.releasePendingRequestExpectingContinue();
+            if (canRetryUnprocessedStream(tx)) {
               retryTxs.add(tx);
             } else {
+              tx.requestTimeout.cancel();
               tx.listener.onThrowable(REMOTELY_CLOSED_EXCEPTION);
             }
           });
 
       if (!retryTxs.isEmpty()) {
-        client.retryHttp2(retryTxs, ctx.channel().eventLoop());
+        retry.accept(retryTxs, ctx.channel().eventLoop());
+      }
+
+    } else if (evt instanceof RstStreamFrame) {
+      RstStreamFrame rstStream = (RstStreamFrame) evt;
+      HttpTx tx = txByStreamId.remove(rstStream.streamId);
+      if (tx != null) {
+        LOGGER.debug("Received RST_STREAM frame: {}", rstStream);
+        // Netty closes the stream after notifying us
+        tx.releasePendingRequestExpectingContinue();
+        if (rstStream.errorCode == Http2Error.REFUSED_STREAM.code()
+            && canRetryUnprocessedStream(tx)) {
+          retry.accept(Collections.singletonList(tx), ctx.channel().eventLoop());
+        } else {
+          tx.requestTimeout.cancel();
+          Http2Error error = Http2Error.valueOf(rstStream.errorCode);
+          tx.listener.onThrowable(
+              new IOException(
+                  "Stream was reset by the server with error code "
+                      + (error != null ? error : rstStream.errorCode)));
+        }
+        channelPool.offer(ctx.channel());
       }
 
     } else if (evt instanceof StreamTimeout) {
@@ -283,16 +377,45 @@ public final class Http2AppHandler extends ChannelDuplexHandler {
     }
   }
 
+  private void resetActiveStreams(ChannelHandlerContext ctx) {
+    ChannelHandlerContext http2Ctx = ctx.pipeline().context(http2ConnectionHandler);
+    try {
+      http2ConnectionHandler
+          .connection()
+          .forEachActiveStream(
+              stream -> {
+                http2ConnectionHandler.resetStream(
+                    http2Ctx, stream.id(), Http2Error.CANCEL.code(), http2Ctx.newPromise());
+                return true;
+              });
+    } catch (Http2Exception e) {
+      LOGGER.debug("Failed to reset active streams", e);
+    }
+  }
+
   private void closeStream(ChannelHandlerContext ctx, int streamId) {
+    Http2Stream stream = http2ConnectionHandler.connection().stream(streamId);
+    if (stream != null && stream.state() == Http2Stream.State.OPEN) {
+      // the server sent a complete response before we sent the whole request, eg it didn't send
+      // 100-Continue: closing the stream locally would leave it half-open on the server side
+      resetStream(ctx, streamId);
+      return;
+    }
     txByStreamId.remove(streamId);
-    http2ConnectionHandler.connection().stream(streamId).close();
+    if (stream != null) {
+      stream.close();
+    }
     channelPool.offer(ctx.channel());
   }
 
   private void resetStream(ChannelHandlerContext ctx, int streamId) {
     txByStreamId.remove(streamId);
+    // the frame must be written from the HTTP/2 handler's context, otherwise it would go through
+    // the outbound handlers in between and be wrapped as a DATA frame by
+    // ByteBufToHttpContentEncoder
+    ChannelHandlerContext http2Ctx = ctx.pipeline().context(http2ConnectionHandler);
     http2ConnectionHandler
-        .resetStream(ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise())
+        .resetStream(http2Ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise())
         .addListener((ChannelFutureListener) future -> channelPool.offer(ctx.channel()));
   }
 }

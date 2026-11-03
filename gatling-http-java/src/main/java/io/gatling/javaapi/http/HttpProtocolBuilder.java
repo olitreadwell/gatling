@@ -781,9 +781,11 @@ public final class HttpProtocolBuilder implements ProtocolBuilder {
   }
 
   /**
-   * Define the remote hosts that are known to support or not support HTTP/2
+   * Define the remote hosts that are known to support or not support HTTP/2. Remotes known to
+   * support HTTP/2 are also used with HTTP/2 without TLS (h2c) for clear http:// urls.
    *
-   * @param remotes the known remote hosts
+   * @param remotes the known remote hosts, as hostname or hostname:port, the port defaulting to
+   *     443, so it must be specified for clear http:// urls, eg "localhost:8080"
    * @return a new HttpProtocolBuilder instance
    */
   public HttpProtocolBuilder http2PriorKnowledge(Map<String, Boolean> remotes) {
@@ -792,6 +794,28 @@ public final class HttpProtocolBuilder implements ProtocolBuilder {
             toScalaMap(
                 remotes.entrySet().stream()
                     .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)))));
+  }
+
+  /**
+   * Define the HTTP/2 flow-control window of each stream, i.e. how many bytes the server can send
+   * on a stream before waiting for the client to acknowledge them. Defaults to 6MB, like Chrome.
+   *
+   * @param bytes the window size in bytes, must be positive
+   * @return a new HttpProtocolBuilder instance
+   */
+  public HttpProtocolBuilder http2StreamWindowSize(int bytes) {
+    return new HttpProtocolBuilder(wrapped.http2StreamWindowSize(bytes));
+  }
+
+  /**
+   * Define the HTTP/2 flow-control window of each connection, shared by all its streams. Defaults
+   * to 15MB, like Chrome.
+   *
+   * @param bytes the window size in bytes, can't be lower than the protocol's initial 65,535
+   * @return a new HttpProtocolBuilder instance
+   */
+  public HttpProtocolBuilder http2ConnectionWindowSize(int bytes) {
+    return new HttpProtocolBuilder(wrapped.http2ConnectionWindowSize(bytes));
   }
 
   // responsePart

@@ -65,7 +65,7 @@ sealed abstract class SessionProcessor(
     val (sessionWithCheckSavedValues, checkError) = CheckProcessor.check(session, response, checks, postChecks)
     val sessionWithHttp2PriorKnowledge =
       if (httpProtocol.enginePart.enableHttp2) {
-        Http2PriorKnowledgeSupport.updateSessionHttp2PriorKnowledge(sessionWithCheckSavedValues, response)
+        Http2PriorKnowledgeSupport.updateSessionHttp2PriorKnowledge(sessionWithCheckSavedValues, httpProtocol, response)
       } else {
         sessionWithCheckSavedValues
       }
@@ -79,6 +79,11 @@ sealed abstract class SessionProcessor(
     val sessionWithCookieStoreUpdate = CookieSupport.storeCookies(session, request.getUri, response.cookies, response.endTimestamp)
     val sessionWithGroupUpdate = updateSessionStats(sessionWithCookieStoreUpdate, response.startTimestamp, response.endTimestamp, OK)
     cacheRedirect(sessionWithGroupUpdate, response, redirectUri)
+  }
+
+  def updatedExpectationFailedSession(session: Session, response: Response): Session = {
+    val sessionWithCookieStoreUpdate = CookieSupport.storeCookies(session, request.getUri, response.cookies, response.endTimestamp)
+    updateSessionStats(sessionWithCookieStoreUpdate, response.startTimestamp, response.endTimestamp, OK)
   }
 
   def updatedDigestChallengeSession(session: Session, response: Response, challenges: Seq[DigestAuth.Challenge]): Session = {

@@ -20,10 +20,14 @@ import io.gatling.http.client.impl.DefaultHttpClient;
 import io.gatling.http.client.resolver.InetAddressNameResolver;
 import io.gatling.http.client.resolver.InetAddressNameResolverWrapper;
 import io.gatling.http.client.uri.Uri;
+import io.gatling.http.client.util.Pair;
 import io.gatling.netty.util.Transports;
+import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
@@ -33,6 +37,7 @@ import javax.net.ssl.SSLException;
 public class GatlingHttpClient implements AutoCloseable {
 
   private final SslContext sslContext;
+  private final SslContext alpnSslContext;
   protected final HttpClient client;
   private final EventLoopGroup eventLoopGroup;
   private final InetAddressNameResolver nameResolver; // would be per request in Gatling
@@ -45,6 +50,18 @@ public class GatlingHttpClient implements AutoCloseable {
     try {
       sslContext =
           SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+      // same as Gatling's, used for HTTP/2 enabled requests
+      alpnSslContext =
+          SslContextBuilder.forClient()
+              .trustManager(InsecureTrustManagerFactory.INSTANCE)
+              .applicationProtocolConfig(
+                  new ApplicationProtocolConfig(
+                      ApplicationProtocolConfig.Protocol.ALPN,
+                      ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                      ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                      ApplicationProtocolNames.HTTP_2,
+                      ApplicationProtocolNames.HTTP_1_1))
+              .build();
     } catch (SSLException e) {
       throw new ExceptionInInitializerError(e);
     }
@@ -57,12 +74,30 @@ public class GatlingHttpClient implements AutoCloseable {
   }
 
   public void execute(Request request, long clientId, boolean shared, HttpListener listener) {
+    execute(request, clientId, shared, nextEventLoop(), listener);
+  }
+
+  public void execute(
+      Request request, long clientId, boolean shared, EventLoop eventLoop, HttpListener listener) {
     client.sendRequest(
         request,
         shared ? -1 : clientId,
-        eventLoopGroup.next(),
+        eventLoop,
         listener,
-        new SslContextsHolder.Default(sslContext, null));
+        new SslContextsHolder.Default(sslContext, alpnSslContext));
+  }
+
+  /** Like Gatling does for resources when the remote is known to support HTTP/2. */
+  public void executeHttp2(Pair<Request, HttpListener>[] requestsAndListeners, long clientId) {
+    client.sendHttp2Requests(
+        requestsAndListeners,
+        clientId,
+        nextEventLoop(),
+        new SslContextsHolder.Default(sslContext, alpnSslContext));
+  }
+
+  public EventLoop nextEventLoop() {
+    return (EventLoop) eventLoopGroup.next();
   }
 
   public RequestBuilder newRequestBuilder(HttpMethod method, Uri uri) {

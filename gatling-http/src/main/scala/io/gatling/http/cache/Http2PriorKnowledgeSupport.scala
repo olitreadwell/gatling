@@ -28,14 +28,25 @@ private[http] object Http2PriorKnowledgeSupport extends StrictLogging {
 
   def setHttp2PriorKnowledge(httpProtocol: HttpProtocol): Session => Session =
     if (httpProtocol.enginePart.enableHttp2) {
-      _.set(Http2PriorKnowledgeAttributeName, Map.empty)
+      // seeded with the remotes configured in the protocol, completed with the protocol negotiated with the other ones
+      _.set(Http2PriorKnowledgeAttributeName, httpProtocol.enginePart.http2PriorKnowledge)
     } else {
       Session.Identity
     }
 
-  @SuppressWarnings(Array("org.wartremover.warts.PartialFunctionApply"))
-  def updateSessionHttp2PriorKnowledge(session: Session, response: Response): Session = {
-    val priorKnowledgeMap = session.attributes(Http2PriorKnowledgeSupport.Http2PriorKnowledgeAttributeName).asInstanceOf[Map[Remote, Http2PriorKnowledge]]
+  /**
+   * The prior knowledge cache, or the one configured in the protocol if the HTTP cache was flushed, as flushing resets what was learned from the responses, not
+   * the configuration.
+   */
+  @SuppressWarnings(Array("org.wartremover.warts.AsInstanceOf"))
+  private def priorKnowledgeCache(session: Session, httpProtocol: HttpProtocol): Map[Remote, Http2PriorKnowledge] =
+    session.attributes
+      .get(Http2PriorKnowledgeAttributeName)
+      .map(_.asInstanceOf[Map[Remote, Http2PriorKnowledge]])
+      .getOrElse(httpProtocol.enginePart.http2PriorKnowledge)
+
+  def updateSessionHttp2PriorKnowledge(session: Session, httpProtocol: HttpProtocol, response: Response): Session = {
+    val priorKnowledgeMap = priorKnowledgeCache(session, httpProtocol)
     val remote = Remote(response.request.getUri)
     if (priorKnowledgeMap.contains(remote)) {
       session
@@ -45,9 +56,14 @@ private[http] object Http2PriorKnowledgeSupport extends StrictLogging {
     }
   }
 
-  @SuppressWarnings(Array("org.wartremover.warts.PartialFunctionApply"))
-  def getHttp2PriorKnowledge(session: Session, remote: Remote): Option[Http2PriorKnowledge] = {
-    val priorKnowledgeMap = session.attributes(Http2PriorKnowledgeSupport.Http2PriorKnowledgeAttributeName).asInstanceOf[Map[Remote, Http2PriorKnowledge]]
-    priorKnowledgeMap.get(remote)
-  }
+  /**
+   * @return
+   *   None when the remote's support for HTTP/2 is unknown, or when HTTP/2 isn't enabled
+   */
+  def getHttp2PriorKnowledge(session: Session, httpProtocol: HttpProtocol, remote: Remote): Option[Http2PriorKnowledge] =
+    if (httpProtocol.enginePart.enableHttp2) {
+      priorKnowledgeCache(session, httpProtocol).get(remote)
+    } else {
+      None
+    }
 }

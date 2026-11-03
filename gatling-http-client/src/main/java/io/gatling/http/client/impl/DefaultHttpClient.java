@@ -17,7 +17,6 @@
 package io.gatling.http.client.impl;
 
 import io.gatling.http.client.*;
-import io.gatling.http.client.body.is.InputStreamRequestBody;
 import io.gatling.http.client.impl.chunk.ForkedChunkedWriteHandler;
 import io.gatling.http.client.impl.compression.CustomDelegatingDecompressorFrameListener;
 import io.gatling.http.client.impl.compression.CustomHttpContentDecompressor;
@@ -43,6 +42,7 @@ import io.netty.handler.codec.http.websocketx.WebSocketFrameAggregator;
 import io.netty.handler.codec.http2.*;
 import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.ApplicationProtocolNegotiationHandler;
+import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.handler.stream.ChunkedWriteHandler;
 import io.netty.resolver.NoopAddressResolverGroup;
@@ -50,21 +50,33 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.*;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class DefaultHttpClient implements HttpClient {
 
-  private static final Http2Settings DEFAULT_HTTP2_SETTINGS = Http2Settings.defaultSettings();
+  static Http2Settings initialHttp2Settings(Http2FlowControlWindows windows) {
+    return Http2Settings.defaultSettings()
+        // we don't support server push: without ENABLE_PUSH=0, servers are allowed to push
+        .pushEnabled(false)
+        .initialWindowSize(windows.getStreamWindowSize());
+  }
 
   static {
     InternalLoggerFactory.setDefaultFactory(Slf4JLoggerFactory.INSTANCE);
@@ -79,6 +91,7 @@ public final class DefaultHttpClient implements HttpClient {
   private static final String SSL_HANDLER = "ssl";
   public static final String HTTP_CLIENT_CODEC = "http";
   private static final String HTTP2_HANDLER = "http2";
+  private static final String HTTP2_CONTENT_ENCODER = "http2-content-encoder";
   private static final String INFLATER_HANDLER = "inflater";
   private static final String CHUNKED_WRITER_HANDLER = "chunked-writer";
   private static final String WS_OBJECT_AGGREGATOR = "ws-object-aggregator";
@@ -107,12 +120,15 @@ public final class DefaultHttpClient implements HttpClient {
     private final ChannelPool channelPool;
 
     private void addHttpHandlers(Channel channel) {
+      CustomHttpContentDecompressor decompressor = new CustomHttpContentDecompressor();
       channel
           .pipeline()
           .addLast(HTTP_CLIENT_CODEC, newHttpClientCodec())
-          .addLast(INFLATER_HANDLER, new CustomHttpContentDecompressor())
+          .addLast(INFLATER_HANDLER, decompressor)
           .addLast(CHUNKED_WRITER_HANDLER, new ChunkedWriteHandler())
-          .addLast(APP_HTTP_HANDLER, new HttpAppHandler(DefaultHttpClient.this, channelPool));
+          .addLast(
+              APP_HTTP_HANDLER,
+              new HttpAppHandler(DefaultHttpClient.this, channelPool, decompressor));
     }
 
     private void addWsHandlers(Channel channel) {
@@ -131,7 +147,13 @@ public final class DefaultHttpClient implements HttpClient {
 
       if (proxyServer instanceof HttpProxyServer) {
         if (((HttpProxyServer) proxyServer).isSecured()) {
-          installSslHandler(tx, ch, proxyServer.getHost(), proxyServer.getPort(), PROXY_SSL_HANDLER)
+          installSslHandler(
+                  tx,
+                  tx.proxySslContext(),
+                  ch,
+                  proxyServer.getHost(),
+                  proxyServer.getPort(),
+                  PROXY_SSL_HANDLER)
               .addListener(
                   f -> {
                     if (tx.requestTimeout.isDone() || !f.isSuccess()) {
@@ -222,6 +244,18 @@ public final class DefaultHttpClient implements HttpClient {
               });
     }
 
+    private Bootstrap getHttp2BootstrapWithProxy(HttpTx tx, ProxyServer proxy) {
+      return http2Bootstrap
+          .clone()
+          .handler(
+              new ChannelInitializer<>() {
+                @Override
+                protected void initChannel(Channel ch) {
+                  addProxyHandlers(ch, tx, proxy);
+                }
+              });
+    }
+
     private Bootstrap getWsBootstrapWithProxy(HttpTx tx, ProxyServer proxy) {
       return wsBootstrap
           .clone()
@@ -296,11 +330,19 @@ public final class DefaultHttpClient implements HttpClient {
     if (isClosed()) {
       return;
     }
+
+    Request headRequest = requestsAndListeners[0].getLeft();
+    if (!HttpTx.isHttp2Candidate(headRequest) && !HttpTx.isH2cCandidate(headRequest)) {
+      // eg through a proxy, even when the remote is known to support HTTP/2
+      for (Pair<Request, HttpListener> pair : requestsAndListeners) {
+        sendRequest(pair.getLeft(), clientId, eventLoop, pair.getRight(), sslContextsHolder);
+      }
+      return;
+    }
+
     for (Pair<Request, HttpListener> pair : requestsAndListeners) {
       pair.getRight().onSend();
     }
-
-    Request headRequest = requestsAndListeners[0].getLeft();
 
     if (headRequest.getUri().isSecured() && headRequest.isHttp2Enabled() && !config.isEnableSni()) {
       for (Pair<Request, HttpListener> requestAndListener : requestsAndListeners) {
@@ -352,10 +394,7 @@ public final class DefaultHttpClient implements HttpClient {
   // only retry pooled keep-alive connections = when keep-alive timeout triggered server side while
   // we were writing and request can be replayed
   boolean canRetry(HttpTx tx) {
-    return tx.channelState == HttpTx.ChannelState.POOLED
-        && !(tx.request.getBody() instanceof InputStreamRequestBody
-            && ((InputStreamRequestBody) tx.request.getBody())
-                .isConsumed()); // InputStreamRequestBody can't be replayed
+    return tx.channelState == HttpTx.ChannelState.POOLED && tx.isBodyReplayable();
   }
 
   void retry(HttpTx tx, EventLoop eventLoop) {
@@ -368,6 +407,10 @@ public final class DefaultHttpClient implements HttpClient {
     sendTx(tx, eventLoop);
   }
 
+  void onFatalError(Throwable cause) {
+    config.getFatalErrorHandler().accept(cause);
+  }
+
   void retryHttp2(List<HttpTx> txs, EventLoop eventLoop) {
     if (isClosed()) {
       return;
@@ -377,7 +420,19 @@ public final class DefaultHttpClient implements HttpClient {
       tx.channelState = HttpTx.ChannelState.RETRY;
     }
     LOGGER.debug("Retrying with new HTTP/2 connection");
-    sendHttp2Txs(txs, eventLoop);
+    for (List<HttpTx> sameRemoteTxs : groupByPoolKey(txs)) {
+      sendHttp2Txs(sameRemoteTxs, eventLoop);
+    }
+  }
+
+  // sendHttp2Txs sends all the txs to the remote of the first one, but the txs dropped by a GOAWAY
+  // on a coalesced connection can target different domains
+  static Collection<List<HttpTx>> groupByPoolKey(List<HttpTx> txs) {
+    Map<ChannelPoolKey, List<HttpTx>> txsByKey = new LinkedHashMap<>();
+    for (HttpTx tx : txs) {
+      txsByKey.computeIfAbsent(tx.key, k -> new ArrayList<>()).add(tx);
+    }
+    return txsByKey.values();
   }
 
   private void sendTx(HttpTx tx, EventLoop eventLoop) {
@@ -386,8 +441,6 @@ public final class DefaultHttpClient implements HttpClient {
     HttpListener listener = tx.listener;
     RequestTimeout requestTimeout = tx.requestTimeout;
     Uri requestUri = request.getUri();
-    boolean tryHttp2 =
-        request.isHttp2Enabled() && requestUri.isSecured() && !requestUri.isWebSocket();
 
     // use a fresh channel for WebSocket
     Channel pooledChannel = requestUri.isWebSocket() ? null : resources.channelPool.poll(tx.key);
@@ -416,7 +469,7 @@ public final class DefaultHttpClient implements HttpClient {
                 if (whenRemoteAddresses.isSuccess()) {
                   List<InetSocketAddress> remoteAddresses = whenRemoteAddresses.getNow();
 
-                  if (tryHttp2 && tx.channelState != HttpTx.ChannelState.RETRY) {
+                  if (tx.canCoalesceConnection() && tx.channelState != HttpTx.ChannelState.RETRY) {
                     String domain = requestUri.getHost();
                     Channel coalescedChannel =
                         resources.channelPool.pollCoalescedChannel(
@@ -468,7 +521,7 @@ public final class DefaultHttpClient implements HttpClient {
 
                 String domain = requestUri.getHost();
                 Channel pooledChannel = resources.channelPool.poll(tx.key);
-                if (pooledChannel == null) {
+                if (pooledChannel == null && tx.canCoalesceConnection()) {
                   pooledChannel =
                       resources.channelPool.pollCoalescedChannel(
                           tx.key.clientId, domain, addresses);
@@ -605,6 +658,7 @@ public final class DefaultHttpClient implements HttpClient {
                 if (requestUri.isSecured()) {
                   installSslHandler(
                           tx,
+                          tx.sslContext(),
                           channel,
                           requestUri.getHost(),
                           requestUri.getExplicitPort(),
@@ -616,9 +670,7 @@ public final class DefaultHttpClient implements HttpClient {
                               return;
                             }
 
-                            if (!tx.request.isHttp2Enabled()
-                                || tx.request.getHttp2PriorKnowledge()
-                                    == Http2PriorKnowledge.HTTP1_ONLY) {
+                            if (!tx.isHttp2Candidate()) {
                               sendTxWithChannel(tx, channel);
                             } else {
                               LOGGER.debug("Installing Http2Handler for {}", requestUri);
@@ -632,6 +684,17 @@ public final class DefaultHttpClient implements HttpClient {
                                         sendTxWithChannel(tx, channel);
                                       });
                             }
+                          });
+                } else if (tx.isH2cCandidate()) {
+                  LOGGER.debug("Installing Http2Handler without TLS (h2c) for {}", requestUri);
+                  installH2cHandler(Collections.singletonList(tx), channel, resources.channelPool)
+                      .addListener(
+                          f -> {
+                            if (tx.requestTimeout.isDone() || !f.isSuccess()) {
+                              channel.close();
+                              return;
+                            }
+                            sendTxWithChannel(tx, channel);
                           });
                 } else {
                   sendTxWithChannel(tx, channel);
@@ -669,9 +732,24 @@ public final class DefaultHttpClient implements HttpClient {
                 ChannelPool.registerPoolKey(channel, tx.key);
 
                 Uri requestUri = tx.request.getUri();
+                if (tx.isH2cCandidate()) {
+                  LOGGER.debug("Installing Http2Handler without TLS (h2c) for {}", requestUri);
+                  installH2cHandler(txs, channel, resources.channelPool)
+                      .addListener(
+                          f -> {
+                            if (tx.requestTimeout.isDone() || !f.isSuccess()) {
+                              channel.close();
+                              return;
+                            }
+                            sendHttp2TxsWithChannel(txs, channel);
+                          });
+                  return;
+                }
+
                 LOGGER.debug("Installing SslHandler for {}", requestUri);
                 installSslHandler(
                         tx,
+                        tx.sslContext(),
                         channel,
                         requestUri.getHost(),
                         requestUri.getExplicitPort(),
@@ -704,18 +782,19 @@ public final class DefaultHttpClient implements HttpClient {
     if (proxyServer != null) {
       if (requestUri.isWebSocket()) {
         return resources.getWsBootstrapWithProxy(tx, proxyServer);
+      } else if (tx.isHttp2Candidate()) {
+        // the remote's TLS connection is tunneled, the HTTP/2 or HTTP/1 handlers are installed
+        // once ALPN is done
+        return resources.getHttp2BootstrapWithProxy(tx, proxyServer);
       } else {
         // HttpProxyHandler doesn't handle clear HTTP requests, only CONNECT ones
-        // FIXME HTTP/2 with proxy
         return resources.getHttp1BootstrapWithProxy(tx, proxyServer);
       }
     }
 
     if (requestUri.isWebSocket()) {
       return resources.wsBootstrap;
-    } else if (requestUri.isSecured()
-        && request.isHttp2Enabled()
-        && request.getHttp2PriorKnowledge() != Http2PriorKnowledge.HTTP1_ONLY) {
+    } else if (tx.isHttp2Candidate() || tx.isH2cCandidate()) {
       return resources.http2Bootstrap;
     } else {
       return resources.http1Bootstrap;
@@ -876,7 +955,12 @@ public final class DefaultHttpClient implements HttpClient {
   }
 
   private Future<Channel> installSslHandler(
-      HttpTx tx, Channel channel, String peerHost, int peerPort, String sslHandlerName) {
+      HttpTx tx,
+      SslContext sslContext,
+      Channel channel,
+      String peerHost,
+      int peerPort,
+      String sslHandlerName) {
     LOGGER.debug("Installing SslHandler for {}:{}", peerHost, peerPort);
     // [e]
     //
@@ -884,7 +968,7 @@ public final class DefaultHttpClient implements HttpClient {
 
     try {
       SslHandler sslHandler =
-          SslHandlers.newSslHandler(tx.sslContext(), channel.alloc(), peerHost, peerPort, config);
+          SslHandlers.newSslHandler(sslContext, channel.alloc(), peerHost, peerPort, config);
 
       ChannelPipeline pipeline = channel.pipeline();
       String after = pipeline.get(PROXY_HANDLER) != null ? PROXY_HANDLER : PINNED_HANDLER;
@@ -929,6 +1013,100 @@ public final class DefaultHttpClient implements HttpClient {
     }
   }
 
+  static void installHttp2Handlers(
+      ChannelPipeline pipeline,
+      Http2FlowControlWindows windows,
+      BiConsumer<List<HttpTx>, EventLoop> retry,
+      Consumer<Throwable> fatalErrorHandler,
+      ChannelPool channelPool,
+      Promise<Void> whenAlpn)
+      throws Http2Exception {
+    Http2Connection connection = new DefaultHttp2Connection(false);
+
+    ChannelPool.registerHttp2Connection(pipeline.channel(), connection);
+
+    CustomDelegatingDecompressorFrameListener decompressorFrameListener =
+        new CustomDelegatingDecompressorFrameListener(
+            connection, new NotAggregatingInboundHttp2ToHttpAdapter(connection, whenAlpn));
+
+    HttpToHttp2ConnectionHandler http2Handler =
+        new HttpToHttp2ConnectionHandlerBuilder()
+            .initialSettings(initialHttp2Settings(windows))
+            .connection(connection)
+            .frameListener(decompressorFrameListener)
+            // queue streams exceeding the server's MAX_CONCURRENT_STREAMS instead of failing them
+            .encoderEnforceMaxConcurrentStreams(true)
+            .build();
+
+    Http2AppHandler http2AppHandler =
+        new Http2AppHandler(retry, fatalErrorHandler, http2Handler, channelPool);
+    decompressorFrameListener.setDecompressionRequired(
+        http2AppHandler::isResponseBodyDecompressionRequired);
+
+    pipeline
+        .addLast(HTTP2_HANDLER, http2Handler)
+        .addLast(HTTP2_CONTENT_ENCODER, ByteBufToHttpContentEncoder.INSTANCE)
+        .addLast(CHUNKED_WRITER_HANDLER, new ForkedChunkedWriteHandler())
+        .addLast(APP_HTTP2_HANDLER, http2AppHandler);
+
+    // the connection window isn't a setting: it always starts at 65,535 bytes and can only be
+    // enlarged with a WINDOW_UPDATE, sent right after the preface
+    int connectionWindowIncrement =
+        windows.getConnectionWindowSize() - Http2CodecUtil.DEFAULT_WINDOW_SIZE;
+    if (connectionWindowIncrement > 0) {
+      connection
+          .local()
+          .flowController()
+          .incrementWindowSize(connection.connectionStream(), connectionWindowIncrement);
+      pipeline.channel().flush();
+    }
+  }
+
+  /**
+   * With prior knowledge, there's no negotiation: the client sends the HTTP/2 preface right away,
+   * and the server's SETTINGS tell it speaks HTTP/2.
+   */
+  private Future<Void> installH2cHandler(
+      List<HttpTx> txs, Channel channel, ChannelPool channelPool) {
+    HttpTx tx = txs.get(0);
+    Promise<Void> whenSettings = channel.eventLoop().newPromise();
+    try {
+      installHttp2Handlers(
+          channel.pipeline(),
+          tx.request.getHttp2FlowControlWindows(),
+          DefaultHttpClient.this::retryHttp2,
+          DefaultHttpClient.this::onFatalError,
+          channelPool,
+          whenSettings);
+    } catch (Http2Exception e) {
+      whenSettings.tryFailure(e);
+    }
+
+    channel
+        .closeFuture()
+        .addListener(
+            f ->
+                whenSettings.tryFailure(
+                    new IOException(
+                        "Connection was closed before receiving HTTP/2 SETTINGS, does "
+                            + tx.request.getUri().getHost()
+                            + " really support HTTP/2 without TLS (h2c)?")));
+
+    whenSettings.addListener(
+        f -> {
+          if (f.isSuccess()) {
+            // only pool once the remote proved it speaks HTTP/2
+            channelPool.offer(channel);
+          } else {
+            for (HttpTx t : txs) {
+              t.requestTimeout.cancel();
+              t.listener.onThrowable(f.cause());
+            }
+          }
+        });
+    return whenSettings;
+  }
+
   private Future<Void> installHttp2Handler(HttpTx tx, Channel channel, ChannelPool channelPool) {
 
     Promise<Void> whenAlpn = channel.eventLoop().newPromise();
@@ -940,35 +1118,26 @@ public final class DefaultHttpClient implements HttpClient {
             ALPN_HANDLER,
             new ApplicationProtocolNegotiationHandler(ApplicationProtocolNames.HTTP_1_1) {
               @Override
-              protected void configurePipeline(ChannelHandlerContext ctx, String protocol)
-                  throws Exception {
+              protected void configurePipeline(
+                  ChannelHandlerContext ctx, String firstSslHandlerProtocol) throws Exception {
+                // ApplicationProtocolNegotiationHandler reads the protocol from the first
+                // SslHandler in the pipeline, which is the proxy's one with an HTTPS proxy
+                String remoteProtocol =
+                    ((SslHandler) ctx.pipeline().get(SSL_HANDLER)).applicationProtocol();
+                String protocol =
+                    remoteProtocol != null ? remoteProtocol : ApplicationProtocolNames.HTTP_1_1;
                 switch (protocol) {
                   case ApplicationProtocolNames.HTTP_2:
                     LOGGER.debug(
                         "ALPN led to HTTP/2 with remote {}", tx.request.getUri().getHost());
                     tx.listener.onProtocolAwareness(true);
-                    Http2Connection connection = new DefaultHttp2Connection(false);
-
-                    ChannelPool.registerHttp2Connection(channel, connection);
-
-                    HttpToHttp2ConnectionHandler http2Handler =
-                        new HttpToHttp2ConnectionHandlerBuilder()
-                            .initialSettings(DEFAULT_HTTP2_SETTINGS)
-                            .connection(connection)
-                            .frameListener(
-                                new CustomDelegatingDecompressorFrameListener(
-                                    connection,
-                                    new NotAggregatingInboundHttp2ToHttpAdapter(
-                                        connection, whenAlpn)))
-                            .build();
-
-                    ctx.pipeline()
-                        .addLast(HTTP2_HANDLER, http2Handler)
-                        .addLast(CHUNKED_WRITER_HANDLER, new ForkedChunkedWriteHandler())
-                        .addLast(
-                            APP_HTTP2_HANDLER,
-                            new Http2AppHandler(DefaultHttpClient.this, http2Handler, channelPool));
-
+                    installHttp2Handlers(
+                        ctx.pipeline(),
+                        tx.request.getHttp2FlowControlWindows(),
+                        DefaultHttpClient.this::retryHttp2,
+                        DefaultHttpClient.this::onFatalError,
+                        channelPool,
+                        whenAlpn);
                     channelPool.offer(channel);
 
                     SslHandler sslHandler = (SslHandler) ctx.pipeline().get(SSL_HANDLER);
@@ -980,7 +1149,7 @@ public final class DefaultHttpClient implements HttpClient {
                           sslHandler.engine().getSession().getProtocol(),
                           sslHandler.engine().getSession().getCipherSuite());
                     }
-                    if (subjectAlternativeNames.size() > 1) {
+                    if (subjectAlternativeNames.size() > 1 && tx.canCoalesceConnection()) {
                       channelPool.offerCoalescedChannel(
                           subjectAlternativeNames,
                           (InetSocketAddress) channel.remoteAddress(),
@@ -1003,13 +1172,15 @@ public final class DefaultHttpClient implements HttpClient {
                       throw e;
                     }
                     tx.listener.onProtocolAwareness(false);
+                    CustomHttpContentDecompressor decompressor =
+                        new CustomHttpContentDecompressor();
                     ctx.pipeline()
                         .addLast(HTTP_CLIENT_CODEC, newHttpClientCodec())
-                        .addLast(INFLATER_HANDLER, new CustomHttpContentDecompressor())
+                        .addLast(INFLATER_HANDLER, decompressor)
                         .addLast(CHUNKED_WRITER_HANDLER, new ForkedChunkedWriteHandler())
                         .addLast(
                             APP_HTTP_HANDLER,
-                            new HttpAppHandler(DefaultHttpClient.this, channelPool));
+                            new HttpAppHandler(DefaultHttpClient.this, channelPool, decompressor));
                     whenAlpn.setSuccess(null);
                     break;
 

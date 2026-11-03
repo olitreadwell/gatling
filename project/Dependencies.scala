@@ -8,7 +8,7 @@ object Dependencies {
   private val gatlingSharedCli               = "io.gatling"                    % "gatling-shared-cli"          % "0.0.7"
   private val gatlingSharedModel             = "io.gatling"                   %% "gatling-shared-model"        % "0.1.3"
   private val gatlingSharedUtil              = "io.gatling"                   %% "gatling-shared-util"         % "0.0.14"
-  private val nettyHttp                      = "io.netty"                      % "netty-codec-http"            % "4.2.19.Final"
+  private val nettyHttp                      = "io.netty"                      % "netty-codec-http"            % "4.2.20.Final"
   private val nettyBuffer                    = nettyHttp.withName("netty-buffer")
   private val nettyHandler                   = nettyHttp.withName("netty-handler")
   private val nettyProxy                     = nettyHttp.withName("netty-handler-proxy")
@@ -17,7 +17,7 @@ object Dependencies {
   private val nettyIoUring                   = nettyHttp.withName("netty-transport-native-io_uring").classifier("linux-x86_64").classifier("linux-aarch_64")
   private val nettyHttp2                     = nettyHttp.withName("netty-codec-http2")
   private val nettyResolverNativeOsX         = nettyHttp.withName("netty-resolver-dns-native-macos").classifier("osx-x86_64").classifier("osx-aarch_64")
-  private val nettyTcNative                  = "io.netty"                      % "netty-tcnative-classes"      % "2.0.84.Final"
+  private val nettyTcNative                  = "io.netty"                      % "netty-tcnative-classes"      % "2.0.85.Final"
   private val nettyTcNativeBoringSsl         = nettyTcNative.withName("netty-tcnative-boringssl-static").classifier("linux-x86_64").classifier("linux-aarch_64").classifier("osx-x86_64").classifier("osx-aarch_64").classifier("windows-x86_64")
   private val brotli4j                       = "com.aayushatharva.brotli4j"    % "brotli4j"                    % "1.24.0"
   private val brotli4jLinuxArm               = brotli4j.withName("native-linux-aarch64")
@@ -58,7 +58,7 @@ object Dependencies {
   private val bouncyCastle                   = "io.gatling"                    % "gatling-recorder-bc-shaded"  % "1.85.0"
 
   // Test dependencies
-  private val activemqBroker                 = "org.apache.activemq"           % "activemq-broker"             % "6.3.3"        % Test
+  private val activemqBroker                 = "org.apache.activemq"           % "activemq-broker"             % "6.4.0"        % Test
   private val h2                             = "com.h2database"                % "h2"                          % "2.5.252"      % Test
   private val jetty                          = "org.eclipse.jetty"             % "jetty-server"                % "12.1.14"      % Test
   private val jettyProxy                     = jetty.withName("jetty-proxy")

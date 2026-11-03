@@ -135,6 +135,8 @@ class HttpCompileTest extends Simulation {
     .hostNameAliases(Map("foo" -> List("127.0.0.1")))
     .enableHttp2
     .http2PriorKnowledge(Map("www.google.com" -> true, "gatling.io" -> false))
+    .http2StreamWindowSize(1024 * 1024)
+    .http2ConnectionWindowSize(10 * 1024 * 1024)
     .perUserKeyManagerFactory { userId =>
       val keyStore = KeyStore.getInstance("PKCS12")
       Using(getClass.getClassLoader.getResourceAsStream("keys/pk-" + userId + ".p12")) {
@@ -189,7 +191,7 @@ class HttpCompileTest extends Simulation {
     .exec(http("Request").get("/").requestTimeout(3.minutes))
     // misc
     .exec(
-      http("Request").get("/").silent.notSilent.disableUrlEncoding.disableFollowRedirect.ignoreProtocolChecks.ignoreProtocolHeaders
+      http("Request").get("/").silent.notSilent.disableUrlEncoding.disableFollowRedirect.enableFollowRedirect.ignoreProtocolChecks.ignoreProtocolHeaders
     )
     // check
     .exec(
@@ -347,6 +349,7 @@ class HttpCompileTest extends Simulation {
         .get("/foo/bar?baz=qix")
         .sign(signatureCalculator)
         .ignoreProtocolSignatureCalculators
+        .ignoreProtocolAuth
     )
     // proxy
     .exec(http("Request").head("/").proxy(Proxy("172.31.76.106", 8080).https))

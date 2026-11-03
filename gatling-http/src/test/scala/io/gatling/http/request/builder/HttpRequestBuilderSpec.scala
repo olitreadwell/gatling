@@ -24,18 +24,23 @@ import io.gatling.ValidationValues
 import io.gatling.commons.util.DefaultClock
 import io.gatling.core.EmptySession
 import io.gatling.core.Predef._
+import io.gatling.core.check.Check
+import io.gatling.core.check.jmespath.{ JmesPathCheckBuilder, JmesPaths }
+import io.gatling.core.check.jsonpath.{ JsonPathCheckBuilder, JsonPaths }
 import io.gatling.core.config.GatlingConfiguration
 import io.gatling.core.session._
 import io.gatling.core.session.el._
 import io.gatling.http.Predef._
-import io.gatling.http.cache.{ DnsCacheSupport, HttpCaches }
+import io.gatling.http.cache.{ DnsCacheSupport, Http2PriorKnowledgeSupport, HttpCaches }
 import io.gatling.http.check.HttpCheckScope._
-import io.gatling.http.client.{ HttpListener, Param }
+import io.gatling.http.check.body.HttpBodyPartialJsonPreparer
+import io.gatling.http.client.{ Http2FlowControlWindows, Http2PriorKnowledge, HttpListener, Param }
 import io.gatling.http.client.body.form.FormUrlEncodedRequestBody
 import io.gatling.http.client.impl.request.WritableRequestBuilder
+import io.gatling.http.client.realm.BasicRealm
 import io.gatling.http.client.resolver.InetAddressNameResolver
 import io.gatling.http.client.uri.Uri
-import io.gatling.http.protocol.HttpProtocol
+import io.gatling.http.protocol.{ HttpProtocol, HttpProtocolBuilder }
 
 import io.netty.buffer.ByteBuf
 import io.netty.handler.codec.http.{ HttpHeaders, HttpMethod, HttpResponseStatus }
@@ -264,6 +269,24 @@ class HttpRequestBuilderSpec extends AnyFlatSpecLike with Matchers with Validati
     )
   }
 
+  "checks" should "share a partial JSON Preparer when all the JSON checks of the request and protocol read simple paths" in {
+    val result = httpRequestDef(
+      _.check(JmesPathCheckBuilder.jmesPath("data[0].id".expressionSuccess, new JmesPaths(10)).find.exists),
+      http(configuration)
+        .baseUrl("https://gatling.io")
+        .check(JsonPathCheckBuilder.jsonPath("$.meta.code".expressionSuccess, new JsonPaths(10)).find.is("OK".expressionSuccess))
+        .build
+    ).build(sessionBase)
+      .map(_.requestConfig.checks)
+      .succeeded
+
+    val preparers = result.map(_.wrapped).collect { case default: Check.Default[_, _, _] => default.preparer }.collect {
+      case preparer: HttpBodyPartialJsonPreparer => preparer
+    }
+    preparers should have size 2
+    preparers.distinct should have size 1
+  }
+
   "checks" should "respect their provenance priority" in {
     val result = httpRequestDef(
       _.check(bodyString.notNull),
@@ -318,6 +341,86 @@ class HttpRequestBuilderSpec extends AnyFlatSpecLike with Matchers with Validati
     )
   }
 
+  private val protocolWithBasicAuth = http(configuration).basicAuth("protocolUser", "protocolPassword").build
+
+  private def realmUsername(f: HttpRequestBuilder => HttpRequestBuilder): Option[String] =
+    httpRequestDef(f, protocolWithBasicAuth)
+      .build(sessionBase)
+      .map(httpRequest => Option(httpRequest.clientRequest.getRealm).collect { case realm: BasicRealm => realm.getUsername })
+      .succeeded
+
+  "auth" should "apply the protocol realm by default" in {
+    realmUsername(identity) shouldBe Some("protocolUser")
+  }
+
+  it should "let the request realm override the protocol one" in {
+    realmUsername(_.basicAuth("requestUser", "requestPassword")) shouldBe Some("requestUser")
+  }
+
+  it should "not apply the protocol realm when ignoreProtocolAuth is set" in {
+    realmUsername(_.ignoreProtocolAuth) shouldBe None
+  }
+
+  it should "still apply the request realm when ignoreProtocolAuth is set" in {
+    realmUsername(_.ignoreProtocolAuth.basicAuth("requestUser", "requestPassword")) shouldBe Some("requestUser")
+  }
+
+  private def followRedirect(f: HttpRequestBuilder => HttpRequestBuilder, httpProtocol: HttpProtocol): Boolean =
+    httpRequestDef(f, httpProtocol).requestConfig.followRedirect
+
+  private val protocolWithoutFollowRedirect = http(configuration).disableFollowRedirect.build
+
+  "followRedirect" should "follow the protocol by default" in {
+    followRedirect(identity, HttpProtocol(configuration)) shouldBe true
+    followRedirect(identity, protocolWithoutFollowRedirect) shouldBe false
+  }
+
+  it should "let the request disable redirects enabled on the protocol" in {
+    followRedirect(_.disableFollowRedirect, HttpProtocol(configuration)) shouldBe false
+  }
+
+  it should "let the request enable redirects disabled on the protocol" in {
+    followRedirect(_.enableFollowRedirect, protocolWithoutFollowRedirect) shouldBe true
+  }
+
   // Not possible to check prior of default over protocol, as only default added value is status
   // and the presence of a status (for same scope priority) remove the default one.
+
+  "HTTP/2 flow-control windows" should "be passed to the client when HTTP/2 is enabled" in {
+    val httpProtocol = HttpProtocolBuilder(configuration).enableHttp2.http2StreamWindowSize(1024 * 1024).build
+
+    httpRequestDef(f = identity, httpProtocol = httpProtocol, urlOrURI = Right(Uri.create("https://gatling.io")))
+      .build(Http2PriorKnowledgeSupport.setHttp2PriorKnowledge(httpProtocol)(sessionBase))
+      .map(_.clientRequest.getHttp2FlowControlWindows)
+      .succeeded shouldBe new Http2FlowControlWindows(1024 * 1024, Http2FlowControlWindows.DEFAULT_CONNECTION_WINDOW_SIZE)
+  }
+
+  "HTTP/2 prior knowledge" should "be passed to the client for the remotes configured in the protocol" in {
+    val httpProtocol = HttpProtocolBuilder(configuration).enableHttp2
+      .http2PriorKnowledge(Map("gatling.io" -> true, "other.gatling.io" -> false))
+      .build
+
+    def priorKnowledge(url: String) =
+      httpRequestDef(f = identity, httpProtocol = httpProtocol, urlOrURI = Right(Uri.create(url)))
+        .build(Http2PriorKnowledgeSupport.setHttp2PriorKnowledge(httpProtocol)(sessionBase))
+        .map(_.clientRequest.getHttp2PriorKnowledge)
+        .succeeded
+
+    priorKnowledge("https://gatling.io") shouldBe Http2PriorKnowledge.HTTP2_SUPPORTED
+    priorKnowledge("https://other.gatling.io") shouldBe Http2PriorKnowledge.HTTP1_ONLY
+    priorKnowledge("https://unknown.gatling.io") shouldBe null
+  }
+
+  it should "still be the configured one after flushing the HTTP cache" in {
+    val httpProtocol = HttpProtocolBuilder(configuration).enableHttp2
+      .http2PriorKnowledge(Map("gatling.io" -> true))
+      .build
+
+    val flushedSession = HttpCaches.FlushCache(Http2PriorKnowledgeSupport.setHttp2PriorKnowledge(httpProtocol)(sessionBase)).succeeded
+
+    httpRequestDef(f = identity, httpProtocol = httpProtocol, urlOrURI = Right(Uri.create("https://gatling.io")))
+      .build(flushedSession)
+      .map(_.clientRequest.getHttp2PriorKnowledge)
+      .succeeded shouldBe Http2PriorKnowledge.HTTP2_SUPPORTED
+  }
 }
