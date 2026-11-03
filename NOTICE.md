@@ -88,7 +88,7 @@ This product depends on jackson, distributed by FasterXML:
 
 This product depends on Jodd, distributed by Igor Spasic:
 
-  * License: license/LICENSE.jsonpath.bsd2.txt (BSD 2-Clause License)
+  * License: license/LICENSE.jodd.bsd2.txt (BSD 2-Clause License)
   * Homepage: http://jodd.org/
 
 This product depends on scala-redis, distributed by Debasish Ghosh:
@@ -106,11 +106,6 @@ This product depends on tdigest, distributed by Ted Dunings:
   * License: license/LICENSE.tdigest.al20.txt (Apache License v2.0)
   * Homepage: https://github.com/tdunning/t-digest
 
-This product depends on HdrHistogram, distributed by Gil Tene:
-
-  * License: license/LICENSE.hdrhistogram.bsd2.txt (BSD 2-Clause License)
-  * Homepage: https://github.com/HdrHistogram/HdrHistogram
-
 This product depends on BouncyCastle, distributed by the Legion of the Bouncy Castle:
 
   * License: license/LICENSE.bouncycastle.mit.txt (MIT License)
@@ -123,7 +118,7 @@ This product depends on Quicklens, distributed by Adam Warski:
 
 This product depends on Caffeine, distributed by Benjamin Manes:
 
-  * License: license/LICENSE.quicklens.al20.txt (Apache License v2.0)
+  * License: license/LICENSE.caffeine.al20.txt (Apache License v2.0)
   * Homepage: https://github.com/ben-manes/caffeine
 
 This product depends on fast-uuid, distributed by Jon Chambers:
@@ -188,7 +183,7 @@ This product depends on Brotli, distributed by Google:
 
 This product depends on Brotli4j, distributed by Aayush Atharva:
 
-* License: license/LICENSE.brotli.al20.txt (Apache License v2.0)
+* License: license/LICENSE.brotli4j.al20.txt (Apache License v2.0)
 * Homepage: https://github.com/hyperxpro/Brotli4j
 
 This product depends on jsr305, distributed by FindBugs:
