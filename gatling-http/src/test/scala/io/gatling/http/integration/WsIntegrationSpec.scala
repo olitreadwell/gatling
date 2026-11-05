@@ -21,6 +21,7 @@ import scala.concurrent.duration._
 import io.gatling.core.CoreDsl
 import io.gatling.core.config.GatlingConfiguration
 import io.gatling.http.{ HttpDsl, HttpSpec, WebSocketServer }
+import io.gatling.http.action.ws.WsInboundMessage
 
 class WsIntegrationSpec extends HttpSpec with CoreDsl with HttpDsl {
   override implicit val configuration: GatlingConfiguration = GatlingConfiguration.loadForTest()
@@ -70,6 +71,141 @@ class WsIntegrationSpec extends HttpSpec with CoreDsl with HttpDsl {
       )
 
       session.isFailed shouldBe true
+    }
+  }
+
+  it should "match messages received before the check was set, keeping the non-matching ones for later setChecks" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""", """{"n":2}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          // no check: replies are received while idle
+          ws("go").sendText("go"),
+          pause(500.millis),
+          ws("second").setCheck.await(1.second)(ws.checkTextMessage("second").matching(jsonPath("$.n").ofType[Int].is(2))),
+          ws("first").setCheck.await(1.second)(ws.checkTextMessage("first").matching(jsonPath("$.n").ofType[Int].is(1))),
+          ws("close").close
+        ),
+        protocolCustomizer = _.wsSetCheckBuffer(10, 5.seconds)
+      )
+
+      session.isFailed shouldBe false
+    }
+  }
+
+  it should "match messages that didn't match a previous check" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""", """{"n":2}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          // n=1 arrives while checking for n=2
+          ws("go").sendText("go").await(1.second)(ws.checkTextMessage("second").matching(jsonPath("$.n").ofType[Int].is(2))),
+          ws("first").setCheck.await(1.second)(ws.checkTextMessage("first").matching(jsonPath("$.n").ofType[Int].is(1))),
+          ws("close").close
+        ),
+        protocolCustomizer = _.wsSetCheckBuffer(10, 5.seconds)
+      )
+
+      session.isFailed shouldBe false
+    }
+  }
+
+  it should "not match messages received before the check was set by default" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          ws("go").sendText("go"),
+          pause(500.millis),
+          ws("first").setCheck.await(1.second)(ws.checkTextMessage("first").check(jsonPath("$.n").ofType[Int].is(1))),
+          ws("close").close
+        )
+      )
+
+      session.isFailed shouldBe true
+    }
+  }
+
+  it should "consume messages received before the check was set" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          ws("go").sendText("go"),
+          pause(500.millis),
+          ws("first").setCheck.await(1.second)(ws.checkTextMessage("first").check(jsonPath("$.n").ofType[Int].is(1))),
+          ws("again").setCheck.await(1.second)(ws.checkTextMessage("again").check(jsonPath("$.n").ofType[Int].is(1))),
+          ws("close").close
+        ),
+        protocolCustomizer = _.wsSetCheckBuffer(10, 5.seconds)
+      )
+
+      session.isFailed shouldBe true
+    }
+  }
+
+  it should "not match messages older than the buffer max age" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          ws("go").sendText("go"),
+          pause(500.millis),
+          ws("first").setCheck.await(1.second)(ws.checkTextMessage("first").check(jsonPath("$.n").ofType[Int].is(1))),
+          ws("close").close
+        ),
+        protocolCustomizer = _.wsSetCheckBuffer(10, 100.millis)
+      )
+
+      session.isFailed shouldBe true
+    }
+  }
+
+  "processUnmatchedMessages" should "receive the messages that didn't match the pending check" in {
+    val handler: String => List[String] = {
+      case "go" => List("""{"n":1}""", """{"n":2}""")
+      case _    => Nil
+    }
+
+    runWithWebSocketServer(handler) { _ =>
+      val session = runScenario(
+        scenario("ws").exec(
+          ws("connect").connect(url),
+          // n=1 arrives while checking for n=2
+          ws("go").sendText("go").await(1.second)(ws.checkTextMessage("second").matching(jsonPath("$.n").ofType[Int].is(2))),
+          ws.processUnmatchedMessages((messages, session) => session.set("unmatched", messages.collect { case WsInboundMessage.Text(_, text) => text })),
+          ws("close").close
+        ),
+        protocolCustomizer = _.wsUnmatchedInboundMessageBufferSize(10)
+      )
+
+      session.isFailed shouldBe false
+      session("unmatched").as[List[String]] shouldBe List("""{"n":1}""")
     }
   }
 
