@@ -28,9 +28,9 @@ object Dependencies {
   private val caffeine                       = "com.github.ben-manes.caffeine" % "caffeine"                    % "3.3.1"
   private val cfor                           = "io.github.metarank"           %% "cfor"                        % "0.4"
   private val commonsPool2                   = "org.apache.commons"            % "commons-pool2"               % "2.13.1"
-  private val config                         = "com.typesafe"                  % "config"                      % "1.4.9"
+  private val config                         = "com.typesafe"                  % "config"                      % "1.4.10"
   private val fastUuid                       = "com.eatthepath"                % "fast-uuid"                   % "0.2.0"
-  private val jackson                        = "com.fasterxml.jackson.core"    % "jackson-databind"            % "2.22.4"
+  private val jackson                        = "com.fasterxml.jackson.core"    % "jackson-databind"            % "2.23.0"
   private val jmespath                       = "io.burt"                       % "jmespath-jackson"            % "0.6.0"
   private val jmsApi                         = "jakarta.jms"                   % "jakarta.jms-api"             % "3.1.0"
   private val joddUtil                       = "org.jodd"                      % "jodd-util"                   % "6.3.0"
@@ -47,7 +47,7 @@ object Dependencies {
   private val julToSlf4j                     = "org.slf4j"                     % "jul-to-slf4j"                % slf4jApi.revision
   private val testInterface                  = "org.scala-sbt"                 % "test-interface"              % "1.0"
   private val typetools                      = "net.jodah"                     % "typetools"                   % "0.7.0"
-  private val xmlresolver                    = "org.xmlresolver"               % "xmlresolver"                 % "6.1.0"
+  private val xmlresolver                    = "org.xmlresolver"               % "xmlresolver"                 % "6.1.1"
   private val xmlresolverData                = xmlresolver                                           classifier "data"
 
   // Charts dependencies
