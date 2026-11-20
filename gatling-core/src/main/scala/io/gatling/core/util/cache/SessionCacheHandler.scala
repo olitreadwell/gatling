@@ -40,6 +40,8 @@ class SessionCacheHandler[K, V](cacheName: String, maxCapacity: Int) {
     }
   }
 
+  def cacheExists(session: Session): Boolean = session.attributes.contains(cacheName)
+
   def getEntry(session: Session, key: => K): Option[V] =
     getCache(session).flatMap(_.get(key))
 

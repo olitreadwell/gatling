@@ -19,7 +19,7 @@ package io.gatling.http.engine.tx
 import io.gatling.core.CoreComponents
 import io.gatling.core.controller.throttle.Throttler
 import io.gatling.core.util.NameGen
-import io.gatling.http.cache.{ ContentCacheEntry, HttpCaches, SslContextSupport }
+import io.gatling.http.cache.{ HttpCaches, SslContextSupport }
 import io.gatling.http.client.HttpListener
 import io.gatling.http.client.util.Pair
 import io.gatling.http.engine.{ GatlingHttpListener, HttpEngine }
@@ -42,62 +42,54 @@ final class HttpTxExecutor(
 
   private[http] val resourceFetcher = new ResourceFetcher(coreComponents, httpCaches, httpProtocol, httpTxExecutor = this)
 
+  // performed when sending, after applying permanent redirects, so the validators are the ones of the actual target
+  private def withCacheValidators(tx: HttpTx): HttpTx =
+    httpCaches.withValidators(tx.session, tx.request.clientRequest) match {
+      case Some(clientRequest) => tx.copy(request = tx.request.copy(clientRequest = clientRequest), cacheValidators = true)
+      case _                   => tx
+    }
+
   private def executeWithCache(origTx: HttpTx)(f: HttpTx => Unit): Unit = {
     val tx = httpCaches.applyPermanentRedirect(origTx)
     val clientRequest = tx.request.clientRequest
     val uri = clientRequest.getUri
 
-    httpCaches.contentCacheEntry(tx.session, clientRequest) match {
-      case None | Some(ContentCacheEntry(None, _, _)) =>
-        f(tx)
+    if (!httpCaches.isFresh(tx.session, clientRequest)) {
+      f(withCacheValidators(tx))
+    } else {
+      resourceFetcher.newResourceAggregatorForCachedPage(tx) match {
+        case Some(aggregator) =>
+          logger.debug(
+            s"Fetching resources of cached page request=${tx.request.requestName} uri=$uri: scenario=${tx.session.scenario}, userId=${tx.session.userId}"
+          )
+          aggregator.start(tx.session)
 
-      case Some(ContentCacheEntry(Some(expire), _, _)) if clock.nowMillis > expire =>
-        val newTx = tx.copy(session = httpCaches.clearContentCache(tx.session, clientRequest))
-        f(newTx)
-
-      case _ =>
-        resourceFetcher.newResourceAggregatorForCachedPage(tx) match {
-          case Some(aggregator) =>
-            logger.debug(
-              s"Fetching resources of cached page request=${tx.request.requestName} uri=$uri: scenario=${tx.session.scenario}, userId=${tx.session.userId}"
-            )
-            aggregator.start(tx.session)
-
-          case _ =>
-            logger.debug(s"Skipping cached request=${tx.request.requestName} uri=$uri: scenario=${tx.session.scenario}, userId=${tx.session.userId}")
-            tx.resourceTx match {
-              case Some(resourceTx) => resourceTx.aggregator.onCachedResource(resourceTx, tx)
-              case _                => tx.next ! tx.session
-            }
-        }
+        case _ =>
+          logger.debug(s"Skipping cached request=${tx.request.requestName} uri=$uri: scenario=${tx.session.scenario}, userId=${tx.session.userId}")
+          tx.resourceTx match {
+            case Some(resourceTx) => resourceTx.aggregator.onCachedResource(resourceTx, tx)
+            case _                => tx.next ! tx.session
+          }
+      }
     }
   }
 
   private def executeHttp2WithCache(origTxs: Iterable[HttpTx])(f: Iterable[HttpTx] => Unit): Unit = {
     val cached = scala.collection.mutable.ListBuffer[HttpTx]()
     val nonCached = scala.collection.mutable.ListBuffer[HttpTx]()
-    var session = origTxs.head.session
 
     origTxs.foreach { tx =>
       val updatedTx = httpCaches.applyPermanentRedirect(tx)
-      val txCacheEntry = httpCaches.contentCacheEntry(updatedTx.session, updatedTx.request.clientRequest)
-      txCacheEntry match {
-        case None | Some(ContentCacheEntry(None, _, _)) =>
-          nonCached += updatedTx
-
-        case Some(ContentCacheEntry(Some(expire), _, _)) if clock.nowMillis > expire =>
-          val requestToClean = updatedTx.request.clientRequest
-          session = httpCaches.clearContentCache(session, requestToClean)
-          nonCached += updatedTx
-
-        case _ =>
-          cached += updatedTx
+      if (httpCaches.isFresh(updatedTx.session, updatedTx.request.clientRequest)) {
+        cached += updatedTx
+      } else {
+        nonCached += withCacheValidators(updatedTx)
       }
     }
 
-    f(nonCached.map(_.copy(session = session)))
+    f(nonCached)
 
-    cached.map(_.copy(session = session)).foreach { tx =>
+    cached.foreach { tx =>
       val uri = tx.request.clientRequest.getUri
       resourceFetcher.newResourceAggregatorForCachedPage(tx) match {
         case Some(aggregator) =>

@@ -24,7 +24,7 @@ import io.gatling.commons.validation._
 import io.gatling.core.body._
 import io.gatling.core.config.GatlingConfiguration
 import io.gatling.core.session._
-import io.gatling.http.cache.{ ContentCacheEntry, Http2PriorKnowledgeSupport, HttpCaches }
+import io.gatling.http.cache.{ Http2PriorKnowledgeSupport, HttpCaches }
 import io.gatling.http.client.{ Param, Request, RequestBuilder => ClientRequestBuilder }
 import io.gatling.http.client.body.RequestBodyBuilder
 import io.gatling.http.client.body.bytearray.ByteArrayRequestBodyBuilder
@@ -37,8 +37,6 @@ import io.gatling.http.client.body.stringchunks.StringChunksRequestBodyBuilder
 import io.gatling.http.protocol.{ HttpProtocol, Remote }
 import io.gatling.http.request.BodyPart
 import io.gatling.http.util.HttpHelper
-
-import io.netty.handler.codec.http.HttpHeaderNames
 
 object HttpRequestExpressionBuilder {
   private val bodyPartsToMultipartsZero: Validation[List[Part[_]]] = Nil.success
@@ -163,22 +161,4 @@ final class HttpRequestExpressionBuilder(
       _ <- configureBody(session, requestBuilder)
     } yield configurePriorKnowledge(session, requestBuilder)
 
-  private def configureCachingHeaders(session: Session, request: Request): Unit =
-    httpCaches.contentCacheEntry(session, request).foreach { case ContentCacheEntry(_, etag, lastModified) =>
-      etag.foreach(request.getHeaders.set(HttpHeaderNames.IF_NONE_MATCH, _))
-      lastModified.foreach(request.getHeaders.set(HttpHeaderNames.IF_MODIFIED_SINCE, _))
-    }
-
-  override def build: Expression[Request] = {
-    val exp = super.build
-    if (httpProtocol.requestPart.cache) { session =>
-      exp(session).map { request =>
-        // perform here as we need the computed absolute uri
-        configureCachingHeaders(session, request)
-        request
-      }
-    } else {
-      exp
-    }
-  }
 }

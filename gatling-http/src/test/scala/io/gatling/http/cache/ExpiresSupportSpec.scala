@@ -20,16 +20,94 @@ import org.scalatest.flatspec.AnyFlatSpecLike
 import org.scalatest.matchers.should.Matchers
 
 class ExpiresSupportSpec extends AnyFlatSpecLike with Matchers {
-  "extractLongValue" should "throw an IllegalArgumentException if start < 0 or > the string length " in {
-    an[IllegalArgumentException] should be thrownBy ExpiresSupport.extractLongValue("1234", -1)
-    an[IllegalArgumentException] should be thrownBy ExpiresSupport.extractLongValue("1234", 4)
+  "parseDeltaSeconds" should "parse non negative integers" in {
+    ExpiresSupport.parseDeltaSeconds("0") shouldBe Some(0L)
+    ExpiresSupport.parseDeltaSeconds("567") shouldBe Some(567L)
   }
 
-  it should "be able to extract a Long from a series of digits in a string" in {
-    ExpiresSupport.extractLongValue("foo12345bar", 3) shouldBe 12345L
+  it should "reject invalid values" in {
+    ExpiresSupport.parseDeltaSeconds("") shouldBe None
+    ExpiresSupport.parseDeltaSeconds("-1") shouldBe None
+    ExpiresSupport.parseDeltaSeconds("nicolas") shouldBe None
+    ExpiresSupport.parseDeltaSeconds("1.5") shouldBe None
   }
 
-  it should "return 0 if there was no series of digit at the specified index" in {
-    ExpiresSupport.extractLongValue("foobar", 3) shouldBe 0L
+  it should "cap values to 2^31" in {
+    ExpiresSupport.parseDeltaSeconds("2147483649") shouldBe Some(2147483648L)
+    ExpiresSupport.parseDeltaSeconds("99999999999999999999") shouldBe Some(2147483648L)
+  }
+
+  it should "ignore surrounding spaces" in {
+    ExpiresSupport.parseDeltaSeconds(" 60 ") shouldBe Some(60L)
+    ExpiresSupport.parseDeltaSeconds("   ") shouldBe None
+  }
+
+  it should "ignore leading zeros" in {
+    ExpiresSupport.parseDeltaSeconds("00000000060") shouldBe Some(60L)
+    ExpiresSupport.parseDeltaSeconds("000") shouldBe Some(0L)
+  }
+
+  private def tokens(value: String): List[String] = {
+    val tokens = scala.collection.mutable.ListBuffer.empty[String]
+    HeaderTokens.exists(value) { (start, end) =>
+      tokens += value.substring(start, end)
+      false
+    }
+    tokens.toList
+  }
+
+  "HeaderTokens.exists" should "split on commas, trim whitespace and drop empty tokens" in {
+    tokens(" a ,\tb,, c ") shouldBe List("a", "b", "c")
+    tokens("") shouldBe Nil
+  }
+
+  it should "ignore commas in quoted strings" in {
+    tokens("a=\"b, c\", d") shouldBe List("a=\"b, c\"", "d")
+    tokens("a=\"b\\\", c\", d") shouldBe List("a=\"b\\\", c\"", "d")
+  }
+
+  it should "keep the last token of malformed values" in {
+    tokens("a, b=\"c, d") shouldBe List("a", "b=\"c, d")
+    tokens("a, b=\"c\\") shouldBe List("a", "b=\"c\\")
+  }
+
+  it should "stop as soon as a token matches" in {
+    var seen = 0
+    HeaderTokens.exists("a, b, c") { (start, _) =>
+      seen += 1
+      start == 3
+    } shouldBe true
+    seen shouldBe 2
+  }
+
+  "CacheControl.parse" should "parse directives case-insensitively" in {
+    CacheControl.parse("Public, MAX-AGE=60, No-Cache, must-revalidate, no-store") shouldBe CacheControl(
+      noStore = true,
+      noCache = true,
+      mustRevalidate = true,
+      maxAge = Some(60)
+    )
+  }
+
+  it should "only match exact no-cache and no-store, like Chrome" in {
+    CacheControl
+      .parse("no-cache=\"Set-Cookie\", no-store=\"foo\"") shouldBe CacheControl(noStore = false, noCache = false, mustRevalidate = false, maxAge = None)
+  }
+
+  it should "keep the first valid max-age, like Chrome" in {
+    CacheControl.parse("max-age=60, max-age=10").maxAge shouldBe Some(60)
+    CacheControl.parse("max-age=nicolas, max-age=10").maxAge shouldBe Some(10)
+    CacheControl.parse("max-age=\"60\"").maxAge shouldBe None
+    CacheControl.parse("max-age = 60").maxAge shouldBe None
+  }
+
+  "parseHttpDate" should "support the HTTP date format" in {
+    ExpiresSupport.parseHttpDate("Thu, 01 Dec 1994 16:00:00 GMT") shouldBe Some(786297600000L)
+    ExpiresSupport.parseHttpDate("\"Tue, 19 Jan 2038 03:14:06 GMT\"") shouldBe Some(2147483646000L)
+  }
+
+  it should "reject invalid dates" in {
+    ExpiresSupport.parseHttpDate("0") shouldBe None
+    ExpiresSupport.parseHttpDate("fail") shouldBe None
   }
 }
