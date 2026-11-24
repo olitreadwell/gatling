@@ -8,7 +8,7 @@ object Dependencies {
   private val gatlingSharedCli               = "io.gatling"                    % "gatling-shared-cli"          % "0.1.0"
   private val gatlingSharedModel             = "io.gatling"                   %% "gatling-shared-model"        % "0.2.0"
   private val gatlingSharedUtil              = "io.gatling"                   %% "gatling-shared-util"         % "0.1.0"
-  private val nettyHttp                      = "io.netty"                      % "netty-codec-http"            % "4.2.20.Final"
+  private val nettyHttp                      = "io.netty"                      % "netty-codec-http"            % "4.2.21.Final"
   private val nettyBuffer                    = nettyHttp.withName("netty-buffer")
   private val nettyHandler                   = nettyHttp.withName("netty-handler")
   private val nettyProxy                     = nettyHttp.withName("netty-handler-proxy")
@@ -17,7 +17,7 @@ object Dependencies {
   private val nettyIoUring                   = nettyHttp.withName("netty-transport-native-io_uring").classifier("linux-x86_64").classifier("linux-aarch_64")
   private val nettyHttp2                     = nettyHttp.withName("netty-codec-http2")
   private val nettyResolverNativeOsX         = nettyHttp.withName("netty-resolver-dns-native-macos").classifier("osx-x86_64").classifier("osx-aarch_64")
-  private val nettyTcNative                  = "io.netty"                      % "netty-tcnative-classes"      % "2.0.85.Final"
+  private val nettyTcNative                  = "io.netty"                      % "netty-tcnative-classes"      % "2.0.86.Final"
   private val nettyTcNativeBoringSsl         = nettyTcNative.withName("netty-tcnative-boringssl-static").classifier("linux-x86_64").classifier("linux-aarch_64").classifier("osx-x86_64").classifier("osx-aarch_64").classifier("windows-x86_64")
   private val brotli4j                       = "com.aayushatharva.brotli4j"    % "brotli4j"                    % "1.24.0"
   private val brotli4jLinuxArm               = brotli4j.withName("native-linux-aarch64")
@@ -36,7 +36,7 @@ object Dependencies {
   private val joddUtil                       = "org.jodd"                      % "jodd-util"                   % "6.3.0"
   private val jspecify                       = "org.jspecify"                  % "jspecify"                    % "1.0.1"
   private val lagarto                        = "io.gatling"                    % "jodd-lagarto"                % "6.1.0"
-  private val logback                        = "ch.qos.logback"                % "logback-classic"             % "1.6.7"
+  private val logback                        = "ch.qos.logback"                % "logback-classic"             % "1.6.8"
   private val pebble                         = "io.pebbletemplates"            % "pebble"                      % "4.1.3"
   private val redisClient                    = "net.debasishg"                %% "redisclient"                 % "3.42"
   private val saxon                          = "net.sf.saxon"                  % "Saxon-HE"                    % "12.10"
